@@ -10,7 +10,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     pkg_share = get_package_share_directory("remote_rosbag_record")
-    default_config = str(Path(pkg_share) / "config" / "record_params.yaml")
+    default_config = str(Path(pkg_share) / "config" / "record_params.example.yaml")
 
     config_arg = DeclareLaunchArgument(
         "config",
