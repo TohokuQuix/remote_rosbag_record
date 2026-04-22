@@ -1,154 +1,203 @@
+// Copyright 2025 Quix, Tohoku University
+// ROS 2 Jazzy port of remote_rosbag_record/record
+//
+// Services:
+//   ~/start  (std_srvs/srv/Trigger) — begin recording
+//   ~/stop   (std_srvs/srv/Trigger) — finalize and close bag
+//
+// Topics published:
+//   ~/is_recording  (std_msgs/msg/Bool, transient_local) — current state
+//
+// Parameters (all settable before calling start):
+//   record_all              bool              false
+//   topics                  string[]          []
+//   regex                   string            ""
+//   exclude_regex           string            ""
+//   include_unpublished     bool              true
+//   include_hidden          bool              false
+//   storage_id              string            "mcap"
+//   output_directory        string            ""   (current dir if empty)
+//   prefix                  string            ""
+//   name                    string            ""   (overrides prefix+date)
+//   append_date             bool              true
+
+#include <chrono>
+#include <ctime>
+#include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
-#include <ros/callback_queue.h>
-#include <ros/console.h>
-#include <ros/init.h>
-#include <ros/node_handle.h>
-#include <ros/param.h>
-#include <ros/publisher.h>
-#include <ros/service_server.h>
-#include <ros/spinner.h>
-#include <rosbag/recorder.h>
-#include <std_msgs/Bool.h>
-#include <std_srvs/Empty.h>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
+#include <rosbag2_cpp/writer.hpp>
+#include <rosbag2_storage/storage_options.hpp>
+#include <rosbag2_transport/record_options.hpp>
+#include <rosbag2_transport/recorder.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
+using std::placeholders::_1;
+using std::placeholders::_2;
 
-boost::scoped_ptr< rosbag::Recorder > recorder;
-boost::thread run_thread;
-boost::thread shutdown_thread;
-ros::Publisher is_recording_publisher;
+class RemoteRosbagRecord : public rclcpp::Node
+{
+public:
+  RemoteRosbagRecord()
+  : Node("remote_rosbag_record")
+  {
+    declare_parameter<bool>("record_all", false);
+    declare_parameter<std::vector<std::string>>("topics", std::vector<std::string>{});
+    declare_parameter<std::string>("regex", "");
+    declare_parameter<std::string>("exclude_regex", "");
+    declare_parameter<bool>("include_unpublished", true);
+    declare_parameter<bool>("include_hidden", false);
+    declare_parameter<std::string>("storage_id", "mcap");
+    declare_parameter<std::string>("output_directory", "");
+    declare_parameter<std::string>("prefix", "");
+    declare_parameter<std::string>("name", "");
+    declare_parameter<bool>("append_date", true);
 
-void publishIsRecording(const bool is_recording) {
-  std_msgs::BoolPtr msg(new std_msgs::Bool());
-  msg->data = is_recording;
-  is_recording_publisher.publish(msg);
-}
+    is_recording_pub_ = create_publisher<std_msgs::msg::Bool>(
+      "is_recording", rclcpp::QoS(1).transient_local());
+    publish_state(false);
 
-bool start(std_srvs::Empty::Request &, std_srvs::Empty::Response &) {
-  namespace rp = ros::param;
+    start_srv_ = create_service<std_srvs::srv::Trigger>(
+      "start", std::bind(&RemoteRosbagRecord::handle_start, this, _1, _2));
+    stop_srv_ = create_service<std_srvs::srv::Trigger>(
+      "stop",  std::bind(&RemoteRosbagRecord::handle_stop,  this, _1, _2));
 
-  // do nothing if the recorder already started
-  if (recorder || run_thread.joinable()) {
-    ROS_ERROR("Already started");
-    return false;
+    RCLCPP_INFO(get_logger(), "Ready — call ~/start to begin recording");
   }
 
-  // read recorder options
-  rosbag::RecorderOptions options;
-  rp::get("~record_all", options.record_all);
-  rp::get("~regex", options.regex);
-  rp::get("~quiet", options.quiet);
-  // note: as of kinetic, the quiet option looks ignored in rosbag::Recorder :(
-  rp::get("~append_date", options.append_date);
-  rp::get("~verbose", options.verbose);
+  ~RemoteRosbagRecord()
   {
-    std::string compression;
-    if (rp::get("~compression", compression)) {
-      if (compression == "uncompressed") {
-        options.compression = rosbag::compression::Uncompressed;
-      } else if (compression == "bz2") {
-        options.compression = rosbag::compression::BZ2;
-      } else if (compression == "lz4") {
-        options.compression = rosbag::compression::LZ4;
-      } else {
-        ROS_WARN_STREAM("Unknown compression type: " << compression);
+    stop_recording();
+  }
+
+private:
+  // ── helpers ────────────────────────────────────────────────────────────────
+
+  void publish_state(bool recording)
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = recording;
+    is_recording_pub_->publish(msg);
+  }
+
+  std::string build_bag_uri() const
+  {
+    const std::string name   = get_parameter("name").as_string();
+    const std::string prefix = get_parameter("prefix").as_string();
+    const std::string outdir = get_parameter("output_directory").as_string();
+    const bool append_date   = get_parameter("append_date").as_bool();
+
+    std::string bag_name;
+    if (!name.empty()) {
+      bag_name = name;
+    } else {
+      bag_name = prefix;
+      if (append_date) {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t t = std::chrono::system_clock::to_time_t(now);
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y_%m_%d-%H_%M_%S", std::localtime(&t));
+        bag_name += buf;
       }
     }
-  }
-  rp::get("~prefix", options.prefix);
-  rp::get("~name", options.name);
-  rp::get("~topics", options.topics);
-  {
-    std::string exclude_regex;
-    if (rp::get("~exclude_regex", exclude_regex)) {
-      options.do_exclude = true;
-      options.exclude_regex = exclude_regex;
+
+    if (!outdir.empty()) {
+      bag_name = outdir + "/" + bag_name;
     }
+    return bag_name;
   }
+
+  // ── service handlers ───────────────────────────────────────────────────────
+
+  void handle_start(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> res)
   {
-    int buffer_size;
-    if (rp::get("~buffer_size", buffer_size)) {
-      options.buffer_size = buffer_size;
+    if (recorder_) {
+      RCLCPP_ERROR(get_logger(), "Already recording");
+      res->success = false;
+      res->message = "Already recording";
+      return;
     }
-  }
-  rp::get("~node", options.node);
-  // note: this node aims to enable service-triggered logging.
-  //       so does not support the following options that may autonomously stop logging
-  //   trigger / snapshot / chunk_size / limit / split
-  //   / max_size / max_split / max_duration / min_space
 
-  publishIsRecording(true);
+    rosbag2_storage::StorageOptions storage_opts;
+    storage_opts.storage_id = get_parameter("storage_id").as_string();
+    storage_opts.uri        = build_bag_uri();
 
-  // launch rosbag-record. this thread will continue unless ros::shutdown() has been called
-  ROS_INFO("Start recording");
-  recorder.reset(new rosbag::Recorder(options));
-  run_thread = boost::thread(&rosbag::Recorder::run, recorder.get());
+    rosbag2_transport::RecordOptions record_opts;
+    record_opts.all_topics              = get_parameter("record_all").as_bool();
+    record_opts.topics                  = get_parameter("topics").as_string_array();
+    record_opts.regex                   = get_parameter("regex").as_string();
+    record_opts.exclude_regex           = get_parameter("exclude_regex").as_string();
+    record_opts.include_unpublished_topics = get_parameter("include_unpublished").as_bool();
+    record_opts.include_hidden_topics   = get_parameter("include_hidden").as_bool();
 
-  return true;
-}
+    auto writer = std::make_shared<rosbag2_cpp::Writer>();
+    recorder_ = std::make_shared<rosbag2_transport::Recorder>(
+      writer, storage_opts, record_opts, "rosbag2_recorder");
 
-void sleepAndShutdown() {
-  ros::Duration(0.5).sleep();
-  ros::shutdown();
-}
+    recorder_->record();
 
-bool stop(std_srvs::Empty::Request &, std_srvs::Empty::Response &) {
-  // do nothing if recording never started
-  if (!recorder && !run_thread.joinable()) {
-    ROS_ERROR("Never started");
-    return false;
-  }
+    record_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+    record_exec_->add_node(recorder_);
+    record_thread_ = std::thread([this]() { record_exec_->spin(); });
 
-  // do nothing if the shutdown already scheduled
-  if (shutdown_thread.joinable()) {
-    ROS_ERROR("Already stopped");
-    return false;
+    publish_state(true);
+    RCLCPP_INFO(get_logger(), "Started recording → %s", storage_opts.uri.c_str());
+
+    res->success = true;
+    res->message = "Started → " + storage_opts.uri;
   }
 
-  publishIsRecording(false);
+  void handle_stop(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+  {
+    if (!recorder_) {
+      RCLCPP_ERROR(get_logger(), "Not recording");
+      res->success = false;
+      res->message = "Not recording";
+      return;
+    }
 
-  // schedule a future call of ros::shutdown()
-  // (because a direct call disconnects the current client)
-  ROS_INFO("Stop recording");
-  shutdown_thread = boost::thread(&sleepAndShutdown);
+    stop_recording();
+    publish_state(false);
+    RCLCPP_INFO(get_logger(), "Stopped recording");
 
-  return true;
-}
-
-int main(int argc, char *argv[]) {
-  ros::init(argc, argv, "remote_rosbag_record");
-  ros::NodeHandle nh;
-
-  // rosbag will use the global queue.
-  // to avoid confriction, use local queue for following services
-  ros::CallbackQueue queue;
-  nh.setCallbackQueue(&queue);
-
-  is_recording_publisher = nh.advertise< std_msgs::Bool >("is_recording", 1, true);
-  publishIsRecording(false);
-  ros::ServiceServer start_server(nh.advertiseService("start", start));
-  ros::ServiceServer stop_server(nh.advertiseService("stop", stop));
-
-  // run services. this serving will continue unless ros::shutdown() has been called
-  ros::SingleThreadedSpinner spinner;
-  spinner.spin(&queue);
-
-  // finalize the rosbag-record threads
-  if (run_thread.joinable()) {
-    run_thread.join();
-  }
-  if (shutdown_thread.joinable()) {
-    shutdown_thread.join();
+    res->success = true;
+    res->message = "Stopped recording";
   }
 
-  // manually free the recorder here.
-  // the recorder contains a plugin loaded by class_loader so must be freed
-  // before static variables in class_loader library (or get an exception).
-  // these static variables will be destroyed before the gloval variable recorder 
-  // because they are allocated when the recorder is allocated in start().
-  recorder.reset();
+  void stop_recording()
+  {
+    if (!recorder_) return;
+    recorder_->stop();
+    if (record_exec_) record_exec_->cancel();
+    if (record_thread_.joinable()) record_thread_.join();
+    record_exec_.reset();
+    recorder_.reset();
+  }
 
+  // ── members ────────────────────────────────────────────────────────────────
+
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr    is_recording_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr   start_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr   stop_srv_;
+
+  std::shared_ptr<rosbag2_transport::Recorder>                  recorder_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor>    record_exec_;
+  std::thread                                                    record_thread_;
+};
+
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<RemoteRosbagRecord>());
+  rclcpp::shutdown();
   return 0;
 }
