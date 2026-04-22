@@ -1,0 +1,31 @@
+remote_rosbag_record:
+  ros__parameters:
+    # ── Recording scope ────────────────────────────────────────────────────
+    # Use regex to match topics. All groups are ORed together.
+    # Patterns are matched against the full topic name (std::regex_search).
+    record_all: false
+    regex: >-
+      ^(/tf$|/tf_static$|/joy$|/joint_states$
+      |/front_camera/.*
+      |/rear_camera/.*
+      |/wrist_camera/.*
+      |/thermo_camera/.*
+      |/wrist_realsense/.*
+      |/livox/.*
+      |/chassi.*
+      |/arm.*
+      |/rt_usb_9axisimu/.*
+      |/bno055/.*
+      |/robot_audio/.*
+      |/diagnostics$|/diagnostics_usb$
+      |/system/cpu_usage$)
+    exclude_regex: ""
+    include_unpublished: false
+    include_hidden: false
+
+    # ── Storage ────────────────────────────────────────────────────────────
+    storage_id: "mcap"
+    output_directory: ""   # current directory if empty
+    prefix: "onix_"
+    name: ""               # overrides prefix + date when non-empty
+    append_date: true

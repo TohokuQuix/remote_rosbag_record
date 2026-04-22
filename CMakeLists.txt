@@ -33,4 +33,7 @@ ament_target_dependencies(joy_listener rclcpp sensor_msgs std_srvs)
 install(TARGETS record trigger joy_listener
   DESTINATION lib/${PROJECT_NAME})
 
+install(DIRECTORY config launch
+  DESTINATION share/${PROJECT_NAME})
+
 ament_package()
