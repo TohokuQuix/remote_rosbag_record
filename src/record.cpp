@@ -34,6 +34,7 @@
 #include <rosbag2_storage/storage_options.hpp>
 #include <rosbag2_transport/record_options.hpp>
 #include <rosbag2_transport/recorder.hpp>
+#include <rmw/rmw.h>
 #include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -59,13 +60,15 @@ public:
     declare_parameter<bool>("append_date", true);
 
     is_recording_pub_ = create_publisher<std_msgs::msg::Bool>(
-      "is_recording", rclcpp::QoS(1).transient_local());
+      "/remote_rosbag_record/is_recording", rclcpp::QoS(1).transient_local());
     publish_state(false);
 
     start_srv_ = create_service<std_srvs::srv::Trigger>(
-      "start", std::bind(&RemoteRosbagRecord::handle_start, this, _1, _2));
+      "/remote_rosbag_record/start",
+      std::bind(&RemoteRosbagRecord::handle_start, this, _1, _2));
     stop_srv_ = create_service<std_srvs::srv::Trigger>(
-      "stop",  std::bind(&RemoteRosbagRecord::handle_stop,  this, _1, _2));
+      "/remote_rosbag_record/stop",
+      std::bind(&RemoteRosbagRecord::handle_stop,  this, _1, _2));
 
     RCLCPP_INFO(get_logger(), "Ready — call ~/start to begin recording");
   }
@@ -118,6 +121,8 @@ private:
     const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
   {
+    RCLCPP_INFO(get_logger(), "Received start request");
+
     if (recorder_) {
       RCLCPP_ERROR(get_logger(), "Already recording");
       res->success = false;
@@ -136,28 +141,48 @@ private:
     record_opts.exclude_regex           = get_parameter("exclude_regex").as_string();
     record_opts.include_unpublished_topics = get_parameter("include_unpublished").as_bool();
     record_opts.include_hidden_topics   = get_parameter("include_hidden").as_bool();
+    record_opts.rmw_serialization_format = rmw_get_serialization_format();
 
-    auto writer = std::make_shared<rosbag2_cpp::Writer>();
-    recorder_ = std::make_shared<rosbag2_transport::Recorder>(
-      writer, storage_opts, record_opts, "rosbag2_recorder");
+    RCLCPP_INFO(
+      get_logger(),
+      "Preparing recorder: storage_id=%s serialization_format=%s uri=%s",
+      storage_opts.storage_id.c_str(),
+      record_opts.rmw_serialization_format.c_str(),
+      storage_opts.uri.c_str());
 
-    recorder_->record();
+    try {
+      auto writer = std::make_shared<rosbag2_cpp::Writer>();
+      recorder_ = std::make_shared<rosbag2_transport::Recorder>(
+        writer, storage_opts, record_opts, "rosbag2_recorder");
 
-    record_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
-    record_exec_->add_node(recorder_);
-    record_thread_ = std::thread([this]() { record_exec_->spin(); });
+      record_exec_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+      record_exec_->add_node(recorder_);
+      recorder_->record();
+      record_thread_ = std::thread([this]() { record_exec_->spin(); });
 
-    publish_state(true);
-    RCLCPP_INFO(get_logger(), "Started recording → %s", storage_opts.uri.c_str());
-
-    res->success = true;
-    res->message = "Started → " + storage_opts.uri;
+      publish_state(true);
+      RCLCPP_INFO(get_logger(), "Started recording -> %s", storage_opts.uri.c_str());
+      res->success = true;
+      res->message = "Started -> " + storage_opts.uri;
+      RCLCPP_INFO(get_logger(), "Start request accepted -> %s", storage_opts.uri.c_str());
+    } catch (const std::exception & e) {
+      recorder_.reset();
+      RCLCPP_ERROR(get_logger(), "Failed to start recording: %s", e.what());
+      res->success = false;
+      res->message = std::string("Failed to start recording: ") + e.what();
+    } catch (...) {
+      recorder_.reset();
+      RCLCPP_ERROR(get_logger(), "Failed to start recording with unknown exception");
+      res->success = false;
+      res->message = "Failed to start recording with unknown exception";
+    }
   }
 
   void handle_stop(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
   {
+    RCLCPP_INFO(get_logger(), "Received stop request");
     if (!recorder_) {
       RCLCPP_ERROR(get_logger(), "Not recording");
       res->success = false;
@@ -177,8 +202,12 @@ private:
   {
     if (!recorder_) return;
     recorder_->stop();
-    if (record_exec_) record_exec_->cancel();
-    if (record_thread_.joinable()) record_thread_.join();
+    if (record_exec_) {
+      record_exec_->cancel();
+    }
+    if (record_thread_.joinable()) {
+      record_thread_.join();
+    }
     record_exec_.reset();
     recorder_.reset();
   }
@@ -191,7 +220,7 @@ private:
 
   std::shared_ptr<rosbag2_transport::Recorder>                  recorder_;
   std::unique_ptr<rclcpp::executors::SingleThreadedExecutor>    record_exec_;
-  std::thread                                                    record_thread_;
+  std::thread                                                   record_thread_;
 };
 
 int main(int argc, char * argv[])
